@@ -50,7 +50,15 @@ jobs:
           echo "Sized image to $NEW_SIZE bytes"
 
           # 2. Patch the MBR partition 2 entry: set end CHS to 0xffffff (max)
-          #    and end LBA to $END_LBA. Entry 2 starts at offset 0x1ce.
+          #    and the sector count so the partition ends at LBA $END_LBA.
+          #    Entry 2 starts at offset 0x1ce. MBR field layout:
+          #      bytes 0    boot flag
+          #      bytes 1-3  starting CHS
+          #      byte  4    partition type
+          #      bytes 5-7  ending CHS
+          #      bytes 8-11 starting LBA
+          #      bytes 12-15 number of sectors (count), NOT end LBA.
+          #    For LBA addressing with inclusive bounds, count = end_lba - start_lba + 1.
           python3 - "$IMG" "$END_LBA" <<'PY'
           import sys, struct
           img, end_lba = sys.argv[1], int(sys.argv[2])
@@ -60,18 +68,19 @@ jobs:
               boot = e[0]
               ptype = e[4]
               start_lba = int.from_bytes(e[8:12], 'little')
+              count = end_lba - start_lba + 1
               status = bytes([boot])
               start_chs = b'\xff\xff\xff'
               type_b = bytes([ptype])
               end_chs = b'\xff\xff\xff'
               start_b = struct.pack('<I', start_lba)
-              end_b = struct.pack('<I', end_lba)
-              new_entry = status + start_chs + type_b + end_chs + start_b + end_b
+              count_b = struct.pack('<I', count)
+              new_entry = status + start_chs + type_b + end_chs + start_b + count_b
               if len(new_entry) != 16:
                   raise SystemExit('entry size mismatch')
               f.seek(0x1ce)
               f.write(new_entry)
-              print(f"Patched MBR entry2: boot=0x{boot:02x} type=0x{ptype:02x} start_lba={start_lba} end_lba={end_lba}")
+              print(f"Patched MBR entry2: boot=0x{boot:02x} type=0x{ptype:02x} start_lba={start_lba} count={count} (~{count*512/1024**3:.2f} GiB)")
           PY
 
           # 3. Expose partition 2 as a block device (loop partscan).
@@ -124,6 +133,9 @@ jobs:
           gzip -k -1 "$IMG"
           ls -la "$IMG"*
           echo "Compressed image:"; stat -c %s "$IMG.gz"
+          # Remove the raw (sparse, 62GB logical) img so upload only ships the gzip.
+          rm -f "$IMG"
+          echo "After cleanup:"; ls -la
 
       - name: Upload resized image (artifact)
         uses: actions/upload-artifact@v4
@@ -131,7 +143,6 @@ jobs:
           name: resized-image
           path: |
             *.gz
-            *.img
           if-no-files-found: error
 
       - name: Create GitHub Release
