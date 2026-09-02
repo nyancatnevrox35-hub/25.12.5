@@ -1,0 +1,158 @@
+name: Resize OpenWrt rootfs image
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: resize-image
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: openwrt-25.12.5-rockchip-armv8-radxa_e20c-ext4-sysupgrade.img
+  # Target: partition 2 (rootfs) will span ~58 GiB so it fits a real 64 GB card
+  # with margin. Total image partition 2 ends at this LBA (sector count).
+  PART2_END_LBA: "121600000"
+
+jobs:
+  resize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install image tools
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs fdisk util-linux parted gzip bc
+          command -v resize2fs e2fsck losetup truncate gzip sfdisk
+
+      - name: Verify image present
+        run: |
+          ls -la "$IMAGE_NAME"
+          test -f "$IMAGE_NAME"
+
+      - name: Patch MBR and resize rootfs filesystem
+        run: |
+          set -euxo pipefail
+          IMG="$IMAGE_NAME"
+          END_LBA="$PART2_END_LBA"
+          ORIG_SIZE=$(stat -c %s "$IMG")
+          echo "Original image size: $ORIG_SIZE"
+
+          # 1. Grow the (sparse) image file so partition 2 has room to expand.
+          NEW_SIZE=$(( END_LBA * 512 + 512 ))
+          truncate -s "$NEW_SIZE" "$IMG"
+          echo "Sized image to $NEW_SIZE bytes"
+
+          # 2. Patch the MBR partition 2 entry: set end CHS to 0xffffff (max)
+          #    and the sector count so the partition ends at LBA $END_LBA.
+          #    Entry 2 starts at offset 0x1ce. MBR field layout:
+          #      bytes 0    boot flag
+          #      bytes 1-3  starting CHS
+          #      byte  4    partition type
+          #      bytes 5-7  ending CHS
+          #      bytes 8-11 starting LBA
+          #      bytes 12-15 number of sectors (count), NOT end LBA.
+          #    For LBA addressing with inclusive bounds, count = end_lba - start_lba + 1.
+          python3 - "$IMG" "$END_LBA" <<'PY'
+          import sys, struct
+          img, end_lba = sys.argv[1], int(sys.argv[2])
+          with open(img, 'r+b') as f:
+              f.seek(0x1ce)  # MBR partition entry 2 start
+              e = f.read(16)
+              boot = e[0]
+              ptype = e[4]
+              start_lba = int.from_bytes(e[8:12], 'little')
+              count = end_lba - start_lba + 1
+              status = bytes([boot])
+              start_chs = b'\xff\xff\xff'
+              type_b = bytes([ptype])
+              end_chs = b'\xff\xff\xff'
+              start_b = struct.pack('<I', start_lba)
+              count_b = struct.pack('<I', count)
+              new_entry = status + start_chs + type_b + end_chs + start_b + count_b
+              if len(new_entry) != 16:
+                  raise SystemExit('entry size mismatch')
+              f.seek(0x1ce)
+              f.write(new_entry)
+              print(f"Patched MBR entry2: boot=0x{boot:02x} type=0x{ptype:02x} start_lba={start_lba} count={count} (~{count*512/1024**3:.2f} GiB)")
+          PY
+
+          # 3. Expose partition 2 as a block device (loop partscan).
+          LOOP=$(sudo losetup --find --partscan --show "$IMG")
+          echo "Loop device: $LOOP"
+          sleep 1
+          sudo partprobe "$LOOP" || true
+          ls -la "${LOOP}"* || true
+          PART2="${LOOP}p2"
+          test -b "$PART2" || { echo "partition 2 not found"; sudo losetup -d "$LOOP"; exit 1; }
+
+          # 4. Check then grow the ext4 filesystem inside partition 2.
+          #    e2fsck exit codes: 0 ok, 1 corrected, 2 corrected+reboot, 3 fast-check,
+          #    4 uncorrected (fatal). Tolerate 0-3 but stop on 4.
+          E2RC=0; sudo e2fsck -f -y "$PART2" || E2RC=$?
+          echo "e2fsck returned $E2RC (0-3 ok, 4 fatal)"
+          if [ "$E2RC" -gt 3 ]; then echo "e2fsck left uncorrected errors"; sudo losetup -d "$LOOP"; exit 1; fi
+          sudo resize2fs "$PART2"
+          echo "== After resize2fs =="
+          sudo dumpe2fs -h "$PART2" | grep -E 'Block count|Free blocks|Block size|Filesystem features' || true
+
+          # 5. Detach loop, we're done with block device.
+          sudo losetup -d "$LOOP"
+
+      - name: Verify filesystem and MBR after resize
+        run: |
+          set -euxo pipefail
+          IMG="$IMAGE_NAME"
+          echo "== Final disk size =="
+          stat -c %s "$IMG"
+          echo "== MBR entries =="
+          python3 - "$IMG" <<'PY'
+          import sys
+          img = sys.argv[1]
+          with open(img, 'rb') as f:
+              head = f.read(0x200)
+          for i in range(4):
+              off = 0x1be + i*16
+              e = head[off:off+16]
+              ptype = e[4]
+              start = int.from_bytes(e[8:12], 'little')
+              sectors = int.from_bytes(e[12:16], 'little')
+              print(f"entry{i+1}: type=0x{ptype:02x} start_lba={start} sectors={sectors} end_byte={(start+sectors)*512}")
+          PY
+
+      - name: Compress resized image
+        run: |
+          set -eux
+          IMG="$IMAGE_NAME"
+          gzip -k -1 "$IMG"
+          ls -la "$IMG"*
+          echo "Compressed image:"; stat -c %s "$IMG.gz"
+          # Remove the raw (sparse, 62GB logical) img so upload only ships the gzip.
+          rm -f "$IMG"
+          echo "After cleanup:"; ls -la
+
+      - name: Upload resized image (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: resized-image
+          path: |
+            *.gz
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/heads/')
+        run: |
+          set -eux
+          IMG="$IMAGE_NAME"
+          TAG="rootfs-resize-$(date +%Y%m%d%H%M%S)"
+          gh release create "$TAG" "$IMG.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OpenWrt rootfs resized to fill 64GB card (rootfs ~58 GiB)" \
+            --notes "Resized rootfs (partition 2) from 104MB to ~58GiB and grew the ext4 filesystem to match. Boots via PARTUUID (disk signature OWRT + partition 2), unaffected by the partition boundary change."
+          echo "Release created: $TAG"
