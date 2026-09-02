@@ -147,6 +147,8 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/heads/')
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eux
           IMG="$IMAGE_NAME"
